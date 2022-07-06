@@ -113,6 +113,48 @@ class ConvSubsampling(torch.nn.Module):
                 )
                 layers.append(activation)
                 in_channels = conv_channels
+        elif subsampling == 'dw_striding':
+            self._padding = 1
+            self._stride = 2
+            self._kernel_size = 3
+            self._ceil_mode = False
+
+            # Layer 1
+            layers.append(
+                torch.nn.Conv2d(
+                    in_channels=in_channels,
+                    out_channels=conv_channels,
+                    kernel_size=self._kernel_size,
+                    stride=self._stride,
+                    padding=self._padding,
+                )
+            )
+            in_channels = conv_channels
+            layers.append(activation)
+
+            for i in range(self._sampling_num - 1):
+                layers.extend(
+                    [
+                        torch.nn.Conv2d(
+                            in_channels=in_channels,
+                            out_channels=in_channels,
+                            kernel_size=self._kernel_size,
+                            stride=self._stride,
+                            padding=self._padding,
+                            groups=in_channels,
+                        ),
+                        torch.nn.Conv2d(
+                            in_channels=in_channels,
+                            out_channels=conv_channels,
+                            kernel_size=1,
+                            stride=1,
+                            padding=0,
+                            groups=1,
+                        ),
+                    ]
+                )
+                layers.append(activation)
+                in_channels = conv_channels
         else:
             raise ValueError(f"Not valid sub-sampling: {subsampling}!")
 
