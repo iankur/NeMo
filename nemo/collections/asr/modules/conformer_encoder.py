@@ -131,6 +131,7 @@ class ConformerEncoder(NeuralModule, Exportable):
         dropout=0.1,
         dropout_emb=0.1,
         dropout_att=0.0,
+        group_size=1,
     ):
         super().__init__()
 
@@ -187,6 +188,7 @@ class ConformerEncoder(NeuralModule, Exportable):
                 max_len=pos_emb_max_len,
                 xscale=self.xscale,
                 dropout_rate_emb=dropout_emb,
+                group_size=group_size,
             )
         elif self_attention_model == "abs_pos":
             pos_bias_u = None
@@ -210,6 +212,7 @@ class ConformerEncoder(NeuralModule, Exportable):
                 dropout_att=dropout_att,
                 pos_bias_u=pos_bias_u,
                 pos_bias_v=pos_bias_v,
+                group_size=group_size
             )
             self.layers.append(layer)
 
@@ -221,6 +224,7 @@ class ConformerEncoder(NeuralModule, Exportable):
             self._feat_out = d_model
         self.set_max_audio_length(self.pos_emb_max_len)
         self.use_pad_mask = True
+        self.group_size = group_size
 
     def set_max_audio_length(self, max_audio_length):
         """
@@ -245,7 +249,7 @@ class ConformerEncoder(NeuralModule, Exportable):
     def forward_for_export(self, audio_signal, length):
         max_audio_length: int = audio_signal.size(-1)
 
-        if max_audio_length > self.max_audio_length:
+        if max_audio_length + self.group_size - 1 > self.max_audio_length:
             self.set_max_audio_length(max_audio_length)
 
         if length is None:

@@ -19,6 +19,7 @@ from torch.nn import LayerNorm
 from nemo.collections.asr.parts.submodules.multi_head_attention import (
     MultiHeadAttention,
     RelPositionMultiHeadAttention,
+    GroupedRelPositionMultiHeadAttention,
 )
 from nemo.collections.asr.parts.utils.activations import Swish
 from nemo.core.classes.mixins import AccessMixin
@@ -52,6 +53,7 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
         dropout_att=0.1,
         pos_bias_u=None,
         pos_bias_v=None,
+        group_size=1,
     ):
         super(ConformerLayer, self).__init__()
 
@@ -70,9 +72,14 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
         # multi-headed self-attention module
         self.norm_self_att = LayerNorm(d_model)
         if self_attention_model == 'rel_pos':
-            self.self_attn = RelPositionMultiHeadAttention(
-                n_head=n_heads, n_feat=d_model, dropout_rate=dropout_att, pos_bias_u=pos_bias_u, pos_bias_v=pos_bias_v
-            )
+            if group_size == 1:
+                self.self_attn = RelPositionMultiHeadAttention(
+                    n_head=n_heads, n_feat=d_model, dropout_rate=dropout_att, pos_bias_u=pos_bias_u, pos_bias_v=pos_bias_v
+                )
+            else:
+                self.self_attn = GroupedRelPositionMultiHeadAttention(
+                    n_head=n_heads, n_feat=d_model, dropout_rate=dropout_att, pos_bias_u=pos_bias_u, pos_bias_v=pos_bias_v, group_size=group_size
+                )
         elif self_attention_model == 'abs_pos':
             self.self_attn = MultiHeadAttention(n_head=n_heads, n_feat=d_model, dropout_rate=dropout_att)
         else:

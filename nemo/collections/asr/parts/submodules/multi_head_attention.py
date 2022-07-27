@@ -52,7 +52,7 @@ class MultiHeadAttention(nn.Module):
         dropout_rate (float): dropout rate
     """
 
-    def __init__(self, n_head, n_feat, dropout_rate):
+    def __init__(self, n_head, n_feat, dropout_rate, group_size=1):
         """Construct an MultiHeadedAttention object."""
         super(MultiHeadAttention, self).__init__()
         assert n_feat % n_head == 0
@@ -65,6 +65,7 @@ class MultiHeadAttention(nn.Module):
         self.linear_v = nn.Linear(n_feat, n_feat)
         self.linear_out = nn.Linear(n_feat, n_feat)
         self.dropout = nn.Dropout(p=dropout_rate)
+        self.group_size = group_size
 
     def forward_qkv(self, query, key, value):
         """Transforms query, key and value.
@@ -106,6 +107,8 @@ class MultiHeadAttention(nn.Module):
 
         p_attn = self.dropout(attn)
         x = torch.matmul(p_attn, value)  # (batch, head, time1, d_k)
+        if self.group_size > 1:
+            x = x.reshape(n_batch, self.h, -1, self.d_k)
         x = x.transpose(1, 2).reshape(n_batch, -1, self.h * self.d_k)  # (batch, time1, d_model)
 
         return self.linear_out(x)  # (batch, time1, d_model)
@@ -206,6 +209,125 @@ class RelPositionMultiHeadAttention(MultiHeadAttention):
         return self.forward_attention(v, scores, mask)
 
 
+class GroupedRelPositionMultiHeadAttention(MultiHeadAttention):
+    """Multi-Head Attention layer of Transformer-XL with support of relative positional encoding.
+    Paper: https://arxiv.org/abs/1901.02860
+    Args:
+        n_head (int): number of heads
+        n_feat (int): size of the features
+        dropout_rate (float): dropout rate
+    """
+
+    def __init__(self, n_head, n_feat, dropout_rate, pos_bias_u, pos_bias_v, group_size):
+        """Construct an RelPositionMultiHeadedAttention object."""
+        super().__init__(n_head, n_feat, dropout_rate, group_size)
+        # linear transformation for positional encoding
+        self.linear_pos = nn.Linear(n_feat, n_feat, bias=False)
+        # these two learnable biases are used in matrix c and matrix d
+        # as described in https://arxiv.org/abs/1901.02860 Section 3.3
+        if pos_bias_u is None or pos_bias_v is None:
+            self.pos_bias_u = nn.Parameter(torch.FloatTensor(self.h, self.d_k))
+            self.pos_bias_v = nn.Parameter(torch.FloatTensor(self.h, self.d_k))
+            # nn.init.normal_(self.pos_bias_u, 0.0, 0.02)
+            # nn.init.normal_(self.pos_bias_v, 0.0, 0.02)
+            nn.init.zeros_(self.pos_bias_u)
+            nn.init.zeros_(self.pos_bias_v)
+        else:
+            self.pos_bias_u = pos_bias_u
+            self.pos_bias_v = pos_bias_v
+
+    def rel_shift(self, x):
+        """Compute relative positional encoding.
+        Args:
+            x (torch.Tensor): (batch, nheads, time, 2*time-1)
+        """
+        b, h, qlen, pos_len = x.size()  # (b, h, t1, t2)
+        # need to add a column of zeros on the left side of last dimension to perform the relative shifting
+        x = torch.nn.functional.pad(x, pad=(1, 0))  # (b, h, t1, t2+1)
+        x = x.view(b, h, -1, qlen)  # (b, h, t2+1, t1)
+        # need to drop the first row
+        x = x[:, :, 1:].view(b, h, qlen, pos_len)  # (b, h, t1, t2)
+        return x
+
+    def pad(self, Q, K, V, mask, chunk_size):
+        """
+        https://github.com/burchim/EfficientConformer/blob/b28a0aaa3b182f72abaccbeb12df0402adf96097/models/attentions.py
+        """
+
+        # Compute Overflows
+        overflow_Q = Q.size(2) % chunk_size
+        overflow_KV = K.size(2) % chunk_size
+        
+        padding_Q = chunk_size - overflow_Q if overflow_Q else 0
+        padding_KV = chunk_size - overflow_KV if overflow_KV else 0
+
+        # Input Padding (B, H, T, D) -> (B, H, T + P, D)
+        Q = nn.functional.pad(Q, (0, 0, 0, padding_Q), value=0)
+        K = nn.functional.pad(K, (0, 0, 0, padding_KV), value=0)
+        V = nn.functional.pad(V, (0, 0, 0, padding_KV), value=0)
+
+        # Update Padding Mask
+        if mask is not None:
+            # NOTE pad is (0, padding_Q, 0, padding_KV) in original code
+            # but att_mask will be of shape (B, time1, time2) where time1 is for Q
+            mask = nn.functional.pad(mask, pad=(0, padding_KV, 0, padding_Q), value=1)
+
+        return Q, K, V, mask, padding_Q
+
+    def forward(self, query, key, value, mask, pos_emb):
+        """Compute 'Scaled Dot Product Attention' with rel. positional encoding.
+        Args:
+            query (torch.Tensor): (batch, time1, size)
+            key (torch.Tensor): (batch, time2, size)
+            value(torch.Tensor): (batch, time2, size)
+            mask (torch.Tensor): (batch, time1, time2)
+            pos_emb (torch.Tensor) : (batch, time1, size)
+        Returns:
+            output (torch.Tensor): transformed `value` (batch, time1, d_model) weighted by the query dot key attention
+        """
+        T = query.size(1)
+        q, k, v = self.forward_qkv(query, key, value)
+        q, k, v, mask, padding = self.pad(q, k, v, mask, chunk_size=self.group_size)
+        q = q.transpose(1, 2)  # (batch, time1, head, d_k)
+
+        n_batch_pos = pos_emb.size(0)
+        p = self.linear_pos(pos_emb).view(n_batch_pos, -1, self.h, self.d_k)
+        p = p.transpose(1, 2)  # (batch, head, time1, d_k)
+
+        # (batch, head, time1, d_k)
+        q_with_bias_u = (q + self.pos_bias_u).transpose(1, 2)
+        # (batch, head, time1, d_k)
+        q_with_bias_v = (q + self.pos_bias_v).transpose(1, 2)
+
+        # reshape here for grouped attention
+        n_batch = q_with_bias_u.size(0)
+        q_with_bias_u = q_with_bias_u.reshape(n_batch, self.h, -1, self.group_size * self.d_k)
+        q_with_bias_v = q_with_bias_v.reshape(n_batch, self.h, -1, self.group_size * self.d_k)
+        k = k.reshape(n_batch, self.h, -1, self.group_size * self.d_k)
+        v = v.reshape(n_batch, self.h, -1, self.group_size * self.d_k)
+        p = p.reshape(n_batch_pos, self.h, -1, self.group_size * self.d_k)
+
+        # compute attention score
+        # first compute matrix a and matrix c
+        # as described in https://arxiv.org/abs/1901.02860 Section 3.3
+        # (batch, head, time1, time2)
+        matrix_ac = torch.matmul(q_with_bias_u, k.transpose(-2, -1))
+
+        # compute matrix b and matrix d
+        # (batch, head, time1, time2)
+        matrix_bd = torch.matmul(q_with_bias_v, p.transpose(-2, -1))
+        matrix_bd = self.rel_shift(matrix_bd)
+        # drops extra elements in the matrix_bd to match the matrix_ac's size
+        matrix_bd = matrix_bd[:, :, :, : matrix_ac.size(-1)]
+
+        scores = (matrix_ac + matrix_bd) / self.s_d_k  # (batch, head, time1, time2)
+
+        if mask is not None and self.group_size > 1:
+            mask = mask[:, :: self.group_size, :: self.group_size]
+
+        return self.forward_attention(v, scores, mask)[:,:T]
+
+
 class PositionalEncoding(torch.nn.Module):
     """Fixed sinusoidal positional encoding.
     Args:
@@ -216,13 +338,14 @@ class PositionalEncoding(torch.nn.Module):
         dropout_rate_emb (float): dropout rate for the positional embeddings
     """
 
-    def __init__(self, d_model, dropout_rate, max_len=5000, xscale=None, dropout_rate_emb=0.0):
+    def __init__(self, d_model, dropout_rate, max_len=5000, xscale=None, dropout_rate_emb=0.0, group_size=1):
         """Construct an PositionalEncoding object."""
         super(PositionalEncoding, self).__init__()
         self.d_model = d_model
         self.xscale = xscale
         self.dropout = torch.nn.Dropout(p=dropout_rate)
         self.max_len = max_len
+        self.group_size = group_size
         if dropout_rate_emb > 0:
             self.dropout_emb = nn.Dropout(dropout_rate_emb)
         else:
@@ -247,7 +370,7 @@ class PositionalEncoding(torch.nn.Module):
         """Reset and extend the positional encodings if needed."""
         if hasattr(self, 'pe') and self.pe.size(1) >= length:
             return
-        positions = torch.arange(0, length, dtype=torch.float32, device=device).unsqueeze(1)
+        positions = torch.arange(0, length+self.group_size-1, dtype=torch.float32, device=device).unsqueeze(1)
         self.create_pe(positions=positions)
 
     def forward(self, x: torch.Tensor):
@@ -260,7 +383,10 @@ class PositionalEncoding(torch.nn.Module):
         """
         if self.xscale:
             x = x * self.xscale
-        pos_emb = self.pe[:, : x.size(1)]
+        pos_emb_size = x.size(1)
+        if self.group_size > 1:
+            pos_emb_size += self.group_size - pos_emb_size % self.group_size
+        pos_emb = self.pe[:, : pos_emb_size]
         if self.dropout_emb:
             pos_emb = self.dropout_emb(pos_emb)
         x = x + pos_emb
@@ -280,14 +406,16 @@ class RelPositionalEncoding(PositionalEncoding):
 
     def extend_pe(self, length, device):
         """Reset and extend the positional encodings if needed."""
-        needed_size = 2 * length - 1
+        length += self.group_size - 1
+        adjust_pos = int(self.group_size == 1)
+        needed_size = 2 * length - adjust_pos
         if hasattr(self, 'pe') and self.pe.size(1) >= needed_size:
             return
         # positions would be from negative numbers to positive
         # positive positions would be used for left positions and negative for right positions
-        positions = torch.arange(length - 1, -length, -1, dtype=torch.float32, device=device).unsqueeze(1)
+        positions = torch.arange(length - adjust_pos, -length, -1, dtype=torch.float32, device=device).unsqueeze(1)
         self.create_pe(positions=positions)
-        self.center_pos = torch.tensor(self.pe.size(1) // 2 + 1, dtype=torch.int32, device=device)
+        self.center_pos = torch.tensor(self.pe.size(1) // 2 + adjust_pos, dtype=torch.int32, device=device)
 
     def forward(self, x):
         """Compute positional encoding.
@@ -304,8 +432,11 @@ class RelPositionalEncoding(PositionalEncoding):
         # center_pos would be the index of position 0
         # negative positions would be used for right and positive for left tokens
         # for input of length L, 2*L-1 positions are needed, positions from (L-1) to -(L-1)
-        start_pos = self.center_pos - x.size(1)
-        end_pos = self.center_pos + x.size(1) - 1
+        length = x.size(1)
+        if length % self.group_size:
+            length += self.group_size - length % self.group_size
+        start_pos = self.center_pos - length + (self.group_size if self.group_size > 1 else 0)
+        end_pos = self.center_pos + length - int(1 == self.group_size)
         pos_emb = self.pe[:, start_pos:end_pos]
         if self.dropout_emb:
             pos_emb = self.dropout_emb(pos_emb)
