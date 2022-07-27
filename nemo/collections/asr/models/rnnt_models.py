@@ -26,8 +26,10 @@ from tqdm.auto import tqdm
 
 from nemo.collections.asr.data import audio_to_text_dataset
 from nemo.collections.asr.data.audio_to_text_dali import DALIOutputs
+from nemo.collections.asr.losses.ctc import CTCLoss
 from nemo.collections.asr.losses.rnnt import RNNTLoss, resolve_rnnt_default_loss_name
 from nemo.collections.asr.metrics.rnnt_wer import RNNTWER, RNNTDecoding, RNNTDecodingConfig
+from nemo.collections.asr.metrics.wer import WER, CTCDecoding, CTCDecodingConfig
 from nemo.collections.asr.models.asr_model import ASRModel
 from nemo.collections.asr.modules.rnnt import RNNTDecoderJoint
 from nemo.collections.asr.parts.mixins import ASRModuleMixin
@@ -91,6 +93,30 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, Exportable):
             log_prediction=self._cfg.get('log_prediction', True),
             dist_sync_on_step=True,
         )
+
+        if 'ctc' in self.cfg:
+            self.ctc_decoder = EncDecRNNTModel.from_config_dict(self.cfg.ctc.decoder)
+            self.ctc_loss_weight = self.cfg.ctc.get("ctc_loss_weight", 0.5)
+
+            self.ctc_loss = CTCLoss(
+                num_classes=self.ctc_decoder.num_classes_with_blank - 1,
+                zero_infinity=True,
+                reduction=self.cfg.ctc.get("ctc_reduction", "mean_batch"),
+            )
+
+            ctc_decoding_cfg = self.cfg.ctc.get('decoding', None)
+            if ctc_decoding_cfg is None:
+                ctc_decoding_cfg = OmegaConf.structured(CTCDecodingConfig)
+                with open_dict(self.cfg.ctc):
+                    self.cfg.ctc.decoding = ctc_decoding_cfg
+
+            self.ctc_decoding = CTCDecoding(self.cfg.ctc.decoding, vocabulary=self.ctc_decoder.vocabulary)
+            self.ctc_wer = WER(
+                decoding=self.ctc_decoding,
+                use_cer=self.cfg.ctc.get('use_cer', False),
+                dist_sync_on_step=True,
+                log_prediction=self.cfg.get("log_prediction", False)
+            )
 
         # Whether to compute loss during evaluation
         if 'compute_eval_loss' in self.cfg:
@@ -721,6 +747,26 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, Exportable):
             if compute_wer:
                 tensorboard_logs.update({'training_batch_wer': wer})
 
+        if self.ctc_loss_weight > 0:
+            log_probs = self.ctc_decoder(encoder_output=encoded)
+            ctc_loss = self.ctc_loss(
+                log_probs=log_probs, targets=transcript, input_lengths=encoded_len, target_lengths=transcript_len
+            )
+            tensorboard_logs['train_rnnt_loss'] = loss_value
+            tensorboard_logs['train_ctc_loss'] = ctc_loss
+            loss_value = (1 - self.ctc_loss_weight) * loss_value + self.ctc_loss_weight * ctc_loss
+            tensorboard_logs['train_loss'] = loss_value
+            if (sample_id + 1) % log_every_n_steps == 0:
+                self.ctc_wer.update(
+                    predictions=log_probs,
+                    targets=transcript,
+                    target_lengths=transcript_len,
+                    predictions_lengths=encoded_len
+                )
+                ctc_wer, _, _ = self.ctc_wer.compute()
+                self.ctc_wer.reset()
+                tensorboard_logs.update({'training_batch_wer_ctc': ctc_wer})
+
         # Log items
         self.log_dict(tensorboard_logs)
 
@@ -806,6 +852,24 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, Exportable):
             tensorboard_logs['val_wer_denom'] = wer_denom
             tensorboard_logs['val_wer'] = wer
 
+        if self.ctc_loss_weight > 0:
+            log_probs = self.ctc_decoder(encoder_output=encoded)
+            ctc_loss = self.ctc_loss(
+                log_probs=log_probs, targets=transcript, input_lengths=encoded_len, target_lengths=transcript_len
+            )
+            self.ctc_wer.update(
+                predictions=log_probs, targets=transcript, target_lengths=transcript_len, predictions_lengths=encoded_len
+            )
+            ctc_wer, ctc_wer_num, ctc_wer_denom = self.ctc_wer.compute()
+            self.ctc_wer.reset()
+            tensorboard_logs['val_ctc_loss'] = ctc_loss
+            tensorboard_logs['val_rnnt_loss'] = loss_value
+            loss_value = (1 - self.ctc_loss_weight) * loss_value + self.ctc_loss_weight * ctc_loss
+            tensorboard_logs['val_loss'] = loss_value
+            tensorboard_logs['val_wer_num_ctc'] = ctc_wer_num
+            tensorboard_logs['val_wer_denom_ctc'] = ctc_wer_denom
+            tensorboard_logs['val_wer_ctc'] = ctc_wer
+
         return tensorboard_logs
 
     def test_step(self, batch, batch_idx, dataloader_idx=0):
@@ -817,6 +881,9 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, Exportable):
         }
         if 'val_loss' in logs:
             test_logs['test_loss'] = logs['val_loss']
+        if self.ctc_loss_weight > 0:
+            test_logs['test_wer_num_ctc'] = logs['val_wer_num_ctc']
+            test_logs['test_wer_denom_ctc'] = logs['val_wer_denom_ctc']
         return test_logs
 
     def multi_validation_epoch_end(self, outputs, dataloader_idx: int = 0):
@@ -828,6 +895,10 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, Exportable):
         wer_num = torch.stack([x['val_wer_num'] for x in outputs]).sum()
         wer_denom = torch.stack([x['val_wer_denom'] for x in outputs]).sum()
         tensorboard_logs = {**val_loss_log, 'val_wer': wer_num.float() / wer_denom}
+        if self.ctc_loss_weight > 0:
+            ctc_wer_num = torch.stack([x['val_wer_num_ctc'] for x in outputs]).sum()
+            ctc_wer_denom = torch.stack([x['val_wer_denom_ctc'] for x in outputs]).sum()
+            tensorboard_logs['val_wer_ctc'] = ctc_wer_num.float() / ctc_wer_denom
         return {**val_loss_log, 'log': tensorboard_logs}
 
     def multi_test_epoch_end(self, outputs, dataloader_idx: int = 0):
@@ -839,6 +910,10 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, Exportable):
         wer_num = torch.stack([x['test_wer_num'] for x in outputs]).sum()
         wer_denom = torch.stack([x['test_wer_denom'] for x in outputs]).sum()
         tensorboard_logs = {**test_loss_log, 'test_wer': wer_num.float() / wer_denom}
+        if self.ctc_loss_weight > 0:
+            ctc_wer_num = torch.stack([x['test_wer_num_ctc'] for x in outputs]).sum()
+            ctc_wer_denom = torch.stack([x['test_wer_denom_ctc'] for x in outputs]).sum()
+            tensorboard_logs['test_wer_ctc'] = ctc_wer_num.float() / ctc_wer_denom
         return {**test_loss_log, 'log': tensorboard_logs}
 
     def _setup_transcribe_dataloader(self, config: Dict) -> 'torch.utils.data.DataLoader':
@@ -923,6 +998,8 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, Exportable):
 
     # EncDecRNNTModel is exported in 2 parts
     def list_export_subnets(self):
+        if self.ctc_loss_weight > 0:
+            return ['encoder', 'decoder_joint', 'ctc_decoder']
         return ['encoder', 'decoder_joint']
 
     # for export

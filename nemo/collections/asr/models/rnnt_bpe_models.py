@@ -23,6 +23,7 @@ from pytorch_lightning import Trainer
 from nemo.collections.asr.data import audio_to_text_dataset
 from nemo.collections.asr.losses.rnnt import RNNTLoss
 from nemo.collections.asr.metrics.rnnt_wer_bpe import RNNTBPEWER, RNNTBPEDecoding, RNNTBPEDecodingConfig
+from nemo.collections.asr.metrics.wer_bpe import WERBPE, CTCBPEDecoding, CTCBPEDecodingConfig
 from nemo.collections.asr.models.rnnt_models import EncDecRNNTModel
 from nemo.collections.asr.parts.mixins import ASRBPEMixin
 from nemo.collections.asr.parts.preprocessing.perturb import process_augmentations
@@ -216,6 +217,18 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
             cfg.joint.jointnet.encoder_hidden = cfg.model_defaults.enc_hidden
             cfg.joint.jointnet.pred_hidden = cfg.model_defaults.pred_hidden
 
+        if 'ctc' in cfg:
+            with open_dict(cfg):
+                cfg.ctc.decoder.vocabulary = ListConfig(list(vocabulary.keys()))
+
+            if cfg.ctc.decoder["num_classes"] < 1:
+                logging.info(
+                    "\nReplacing placholder number of classes ({}) with actual number of classes - {}".format(
+                        cfg.ctc.decoder["num_classes"], len(vocabulary)
+                    )
+                )
+                cfg.ctc.decoder["num_classes"] = len(vocabulary)
+
         super().__init__(cfg=cfg, trainer=trainer)
 
         # Setup decoding object
@@ -231,6 +244,21 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
             log_prediction=self._cfg.get('log_prediction', True),
             dist_sync_on_step=True,
         )
+
+        # Setup ctc wer
+        if 'ctc' in self.cfg:
+            ctc_decoding_cfg = self.cfg.ctc.get('decoding', None)
+            if ctc_decoding_cfg is None:
+                ctc_decoding_cfg = OmegaConf.structured(CTCBPEDecodingConfig)
+                with open_dict(self.cfg.ctc):
+                    self.ctg.ctc.decoding = ctc_decoding_cfg
+            self.ctc_decoding = CTCBPEDecoding(self.cfg.ctc.decoding, tokenizer=self.tokenizer)
+            self.ctc_wer = WERBPE(
+                decoding=self.ctc_decoding,
+                use_cer=self.cfg.ctc.get('use_cer', False),
+                dist_sync_on_step=True,
+                log_prediction=self.cfg.get("log_prediction", False)
+            )
 
         # Setup fused Joint step if flag is set
         if self.joint.fuse_loss_wer:
