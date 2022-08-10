@@ -36,6 +36,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 __all__ = [
     'RelPositionMultiHeadAttention',
@@ -310,3 +311,186 @@ class RelPositionalEncoding(PositionalEncoding):
         if self.dropout_emb:
             pos_emb = self.dropout_emb(pos_emb)
         return self.dropout(x), pos_emb
+
+class ChunkedRelPositionalEncoding(PositionalEncoding):
+    """Relative positional encoding for Longformer's non-overlapping
+    sliding window attention or chunked attention. See above for relative
+    positional encoding based on Transformer-XL paper
+    Args:
+        left_chunk_size (int): number of frames to in past chunks
+        chunk size (int): number of frames (max frames if using multimode) in current chunk
+        d_model (int): embedding dim
+        dropout_rate (float): dropout rate
+        max_len (int): maximum input length
+        xscale (bool): whether to scale the input by sqrt(d_model)
+        dropout_rate_emb (float): dropout rate for the positional embeddings
+    """
+    def __init__(self, left_chunk_size, chunk_size, right_chunk_size, **kwargs):
+        super(self, ChunkedRelPositionalEncoding).__init__(**kwargs)
+        self.left_chunk_size = left_chunk_size
+        self.chunk_size = chunk_size
+        self.right_chunk_size = right_chunk_size
+
+    def extend_pe(self, length, device):
+        """Reset and extend the positional encodings only at the beginning
+        as chunk size and left chunk size does not change."""
+        if hasattr(self, 'pe'):
+            return
+
+        # ignore passed length
+        max_left_context_size = self.left_chunk_size + self.chunk_size - 1
+        max_right_context_size = self.chunk_size + self.right_chunk_size - 1
+        positions = torch.arange(max_left_context_size, -max_right_context_size - 1, -1, dtype=torch.float32, device=device).unsqueeze(1)
+        self.create_pe(positions=positions)
+        self.center_pos = torch.tensor(max_left_context_size, dtype=torch.int32, device=device)
+
+    def forward(self, x, left_chunk_size=None, chunk_size=None, right_chunk_size=None):
+        """Compute positional encoding.
+        Args:
+            x (torch.Tensor): Input. Its shape is (batch, time, feature_size)
+        Returns:
+            x (torch.Tensor): Its shape is (batch, time, feature_size)
+            pos_emb (torch.Tensor): Its shape is (1, time, feature_size)
+        """
+
+        if self.xscale:
+            x = x * self.xscale
+
+        # center_pos would be the index of position 0
+        # negative positions would be used for right and positive for left tokens
+        # for input of length L, 2*L-1 positions are needed, positions from (L-1) to -(L-1)
+        if left_chunk_size is None:
+            left_chunk_size = self.left_chunk_size
+        if chunk_size is None:
+            chunk_size = self.chunk_size
+        if right_chunk_size is None:
+            right_chunk_size = self.right_chunk_size
+
+        left_chunk_size += chunk_size - 1
+        right_chunk_size += chunk_size - 1
+
+        start_pos = self.center_pos - left_chunk_size
+        end_pos = self.center_pos + right_chunk_size + 1
+        pos_emb = self.pe[:, start_pos:end_pos]
+        if self.dropout_emb:
+            pos_emb = self.dropout_emb(pos_emb)
+        return self.dropout(x), pos_emb
+
+class ChunkedRelPositionMultiHeadAttention(RelPositionMultiHeadAttention):
+    """Multi-Head Attention layer of Transformer-XL with support of relative positional encoding.
+    Paper: https://arxiv.org/abs/1901.02860
+    Args:
+        n_head (int): number of heads
+        n_feat (int): size of the features
+        dropout_rate (float): dropout rate
+    """
+    def _chunk(self, x, left_chunk_size, chunk_size, right_chunk_size, pad_value=0.):
+        """
+        x: B x H x T x D
+        output: B x H x T // chunk_size x total_chunk_size x D
+        """
+        B, H, T, D = x.size()
+        assert T % chunk_size == 0
+        total_chunk_size = left_chunk_size + chunk_size + right_chunk_size
+        x = F.pad(x, (0, 0, left_chunk_size, right_chunk_size), value=pad_value) # B x H x T x D
+
+        # unfold can be slow
+        # x = x.unfold(dim=dim, size=total_chunk_size, step=chunk_size).transpose(-1, -2)
+        # return x
+
+        output_size = [B, H, T // chunk_size, total_chunk_size, D]
+        stride = list(x.stride())
+        output_stride = stride[:2] + [chunk_size * stride[2]] + stride[-2:]
+
+        return x.as_strided(size=output_size, stride=output_stride)
+
+    def forward_attention(self, value, scores, mask):
+        """Compute attention context vector.
+        Args:
+            value (torch.Tensor): (batch, time2, size)
+            scores(torch.Tensor): (batch, time1, time2)
+            mask(torch.Tensor): (batch, time1, time2)
+        returns:
+            value (torch.Tensor): transformed `value` (batch, time2, d_model) weighted by the attention scores
+        """
+        n_batch = value.size(0)
+        if mask is not None:
+             # B x 1 x T // chunk_size x 1 x total_chunk_size
+            mask = mask.unsqueeze(1)
+            scores = scores.masked_fill(mask, -10000.0)
+            attn = torch.softmax(scores, dim=-1).masked_fill(mask, 0.0)
+        else:
+            attn = torch.softmax(scores, dim=-1)
+
+        # (B, H, T // chunk size, chunk size, total_chunk_size)
+        p_attn = self.dropout(attn)
+        # (B, H, T // chunk size, chunk size, D)
+        x = torch.matmul(p_attn, value)
+        # B x T x D
+        x = x.reshape(n_batch, self.h, -1, self.d_k).transpose(1, 2).reshape(n_batch, -1, self.h * self.d_k)
+
+        return self.linear_out(x)
+
+    def forward(self, query, key, value, mask, pos_emb, left_chunk_size=None, chunk_size=None, right_chunk_size=None):
+        """Compute 'Scaled Dot Product Attention' with rel. positional encoding.
+        Args:
+            query (torch.Tensor): (batch, time1, size)
+            key (torch.Tensor): (batch, time2, size)
+            value(torch.Tensor): (batch, time2, size)
+            mask (torch.Tensor): (batch, time1, time2)
+            pos_emb (torch.Tensor) : (batch, time1, size)
+        Returns:
+            output (torch.Tensor): transformed `value` (batch, time1, d_model) weighted by the query dot key attention
+        """
+        # only pad mask is required
+        assert len(mask.shape) == 2
+        assert q.size(1) == k.size(1)
+        q, k, v = self.forward_qkv(query, key, value)
+
+        # save original length
+        n_batch, _, T, _ = q.size()
+        padding_len = chunk_size - T % chunk_size if T % chunk_size else 0
+        q = F.pad(q, (0, 0, 0, padding_len))
+        k = F.pad(k, (0, 0, 0, padding_len))
+        v = F.pad(v, (0, 0, 0, padding_len))
+
+        # B x H x T // chunk_size x total_chunk_size x D
+        k = self._chunk(k, left_chunk_size, chunk_size, right_chunk_size)
+        v = self._chunk(v, left_chunk_size, chunk_size, right_chunk_size)
+
+        q = q.reshpae(n_batch, self.h, (T + chunk_size - 1) // chunk_size, chunk_size, self.d_k)
+        q = q.transpose(1, 3)
+
+        n_batch_pos = pos_emb.size(0)
+        p = self.linear_pos(pos_emb).view(n_batch_pos, -1, self.h, self.d_k)
+        # B x H x 1 x pos_emb_len x D
+        p = p.transpose(1, 2).unsqueeze(2)  
+
+        # B x H x T // chunk_size x chunk_size x D
+        q_with_bias_u = (q + self.pos_bias_u).transpose(1, 3)
+        q_with_bias_v = (q + self.pos_bias_v).transpose(1, 3)
+
+        # compute attention score
+        # first compute matrix a and matrix c
+        # as described in https://arxiv.org/abs/1901.02860 Section 3.3
+        # (batch, head, time1, time2)
+        # B x H x T // chunk_size x chunk_size x total_chunk_size
+        matrix_ac = torch.matmul(q_with_bias_u, k.transpose(-2, -1))
+
+        # compute matrix b and matrix d
+        # B x H x T // chunk_size x chunk_size x pos_emb_len
+        matrix_bd = torch.matmul(q_with_bias_v, p.transpose(-2, -1))
+        matrix_bd = self.rel_shift(matrix_bd)
+        # drops extra elements in the matrix_bd to match the matrix_ac's size
+        matrix_bd = matrix_bd[:, :, :, : matrix_ac.size(-1)]
+
+        # B x H x T // chunk_size x chunk_size x total_chunk_size
+        scores = (matrix_ac + matrix_bd) / self.s_d_k
+
+        # expand shape to _chunk
+        # B x 1 x T x 1
+        mask = F.pad(mask, (0, padding_len), value=1.).view(n_batch, 1, -1, 1)
+        mask = self._chunk(mask, left_chunk_size, chunk_size, right_chunk_size, pad_value=1.)
+        # B x T // chunk size x 1 x total_chunk size
+        mask = mask.view(n_batch, mask.size(2), 1, mask.size(3))
+        return self.forward_attention(v, scores, mask)[:,:T]
