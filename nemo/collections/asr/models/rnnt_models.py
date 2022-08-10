@@ -885,6 +885,10 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, Exportable):
         if self.ctc_loss_weight > 0:
             test_logs['test_wer_num_ctc'] = logs['val_wer_num_ctc']
             test_logs['test_wer_denom_ctc'] = logs['val_wer_denom_ctc']
+            if 'val_ctc_loss' in logs:
+                test_logs['test_ctc_loss'] = logs['val_ctc_loss']
+            if 'val_rnnt_loss' in logs:
+                test_logs['test_rnnt_loss'] = logs['val_rnnt_loss']
         return test_logs
 
     def multi_validation_epoch_end(self, outputs, dataloader_idx: int = 0):
