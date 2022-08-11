@@ -399,9 +399,8 @@ class ChunkedRelPositionMultiHeadAttention(RelPositionMultiHeadAttention):
         # return x
 
         output_size = [B, H, T // chunk_size, total_chunk_size, D]
-        output_stride = [
-            H * (T // chunk_size) * total_chunk_size * D, (T // chunk_size) * total_chunk_size, chunk_size * D, D, 1
-        ]
+        stride = list(x.stride())
+        output_stride = stride[:2] + [chunk_size * D] + stride[-2:]
         return x.as_strided(size=output_size, stride=output_stride)
 
     def forward_attention(self, value, scores, mask):
