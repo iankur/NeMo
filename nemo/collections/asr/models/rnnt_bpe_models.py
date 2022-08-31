@@ -219,7 +219,10 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
 
         if 'ctc' in cfg:
             with open_dict(cfg):
-                cfg.ctc.decoder.vocabulary = ListConfig(list(vocabulary.keys()))
+                if self.tokenizer_type == "agg":
+                    cfg.ctc.decoder.vocabulary = ListConfig(vocabulary)
+                else:
+                    cfg.ctc.decoder.vocabulary = ListConfig(list(vocabulary.keys()))
 
             if cfg.ctc.decoder["num_classes"] < 1:
                 logging.info(
@@ -251,7 +254,7 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
             if ctc_decoding_cfg is None:
                 ctc_decoding_cfg = OmegaConf.structured(CTCBPEDecodingConfig)
                 with open_dict(self.cfg.ctc):
-                    self.ctg.ctc.decoding = ctc_decoding_cfg
+                    self.cfg.ctc.decoding = ctc_decoding_cfg
             self.ctc_decoding = CTCBPEDecoding(self.cfg.ctc.decoding, tokenizer=self.tokenizer)
             self.ctc_wer = WERBPE(
                 decoding=self.ctc_decoding,
@@ -270,6 +273,7 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
         new_tokenizer_dir: Union[str, DictConfig],
         new_tokenizer_type: str,
         decoding_cfg: Optional[DictConfig] = None,
+        ctc_decoding_cfg: Optional[DictConfig] = None,
     ):
         """
         Changes vocabulary used during RNNT decoding process. Use this method when fine-tuning on from pre-trained model.
@@ -373,9 +377,62 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
         with open_dict(self.cfg.decoding):
             self.cfg.decoding = decoding_cfg
 
+        # set up ctc decoder if required
+        if ctc_decoding_cfg is not None or self.ctc_loss_weight > 0:
+            if hasattr(self, 'ctc_decoder'):
+                decoder_config = self.ctc_decoder.to_config_dict()
+                new_decoder_config = copy.deepcopy(decoder_config)
+
+                del self.ctc_decoder
+                del self.ctc_loss
+            else:
+                new_decoder_config = self.cfg.ctc.decoder
+
+            # sidestepping the potential overlapping tokens issue in aggregate tokenizers
+            if self.tokenizer_type == "agg":
+                new_decoder_config.vocabulary = ListConfig(vocabulary)
+            else:
+                new_decoder_config.vocabulary = ListConfig(list(vocabulary.keys()))
+            new_decoder_config['num_classes'] = len(vocabulary)
+
+            self.ctc_decoder = EncDecCTCModelBPE.from_config_dict(new_decoder_config)
+            self.ctc_loss = CTCLoss(
+                num_classes=self.ctc_decoder.num_classes_with_blank - 1,
+                zero_infinity=True,
+                reduction=self.cfg.ctc.get("ctc_reduction", "mean_batch"),
+            )
+
+            if ctc_decoding_cfg is None:
+                ctc_decoding_cfg = self.cfg.ctc.get('decoding', None)
+            if ctc_decoding_cfg is None:
+                ctc_decoding_cfg = OmegaConf.structured(CTCBPEDecodingConfig)
+                with open_dict(self.cfg.ctc):
+                    self.cfg.ctc.decoding = ctc_decoding_cfg
+
+            # Assert the decoding config with all hyper parameters
+            ctc_decoding_cls = OmegaConf.structured(CTCBPEDecodingConfig)
+            ctc_decoding_cls = OmegaConf.create(OmegaConf.to_container(ctc_decoding_cls))
+            ctc_decoding_cfg = OmegaConf.merge(ctc_decoding_cls, ctc_decoding_cfg)
+
+            self.ctc_decoding = CTCBPEDecoding(decoding_cfg=ctc_decoding_cfg, tokenizer=self.tokenizer)
+
+            self.ctc_wer = WERBPE(
+                decoding=self.ctc_decoding,
+                use_cer=self.cfg.ctc.get('use_cer', False),
+                log_prediction=self.cfg.get("log_prediction", False),
+                dist_sync_on_step=True,
+            )
+
+            # Update config
+            with open_dict(self.cfg.ctc.decoder):
+                self.cfg.ctc.decoder = new_decoder_config
+
+            with open_dict(self.cfg.ctc.decoding):
+                self.cfg.ctc.decoding = ctc_decoding_cfg
+
         logging.info(f"Changed decoder to output to {self.joint.vocabulary} vocabulary.")
 
-    def change_decoding_strategy(self, decoding_cfg: DictConfig):
+    def change_decoding_strategy(self, decoding_cfg: DictConfig, decoder_type: str = None):
         """
         Changes decoding strategy used during RNNT decoding process.
 
@@ -383,40 +440,69 @@ class EncDecRNNTBPEModel(EncDecRNNTModel, ASRBPEMixin):
             decoding_cfg: A config for the decoder, which is optional. If the decoding type
                 needs to be changed (from say Greedy to Beam decoding etc), the config can be passed here.
         """
-        if decoding_cfg is None:
-            # Assume same decoding config as before
-            logging.info("No `decoding_cfg` passed when changing decoding strategy, using internal config")
-            decoding_cfg = self.cfg.decoding
+        if decoder_type is None or decoder_type == 'rnnt':
+            if decoding_cfg is None:
+                # Assume same decoding config as before
+                logging.info("No `decoding_cfg` passed when changing decoding strategy, using internal config")
+                decoding_cfg = self.cfg.decoding
 
-        # Assert the decoding config with all hyper parameters
-        decoding_cls = OmegaConf.structured(RNNTBPEDecodingConfig)
-        decoding_cls = OmegaConf.create(OmegaConf.to_container(decoding_cls))
-        decoding_cfg = OmegaConf.merge(decoding_cls, decoding_cfg)
+            # Assert the decoding config with all hyper parameters
+            decoding_cls = OmegaConf.structured(RNNTBPEDecodingConfig)
+            decoding_cls = OmegaConf.create(OmegaConf.to_container(decoding_cls))
+            decoding_cfg = OmegaConf.merge(decoding_cls, decoding_cfg)
 
-        self.decoding = RNNTBPEDecoding(
-            decoding_cfg=decoding_cfg, decoder=self.decoder, joint=self.joint, tokenizer=self.tokenizer,
-        )
+            self.decoding = RNNTBPEDecoding(
+                decoding_cfg=decoding_cfg, decoder=self.decoder, joint=self.joint, tokenizer=self.tokenizer,
+            )
 
-        self.wer = RNNTBPEWER(
-            decoding=self.decoding,
-            batch_dim_index=self.wer.batch_dim_index,
-            use_cer=self.wer.use_cer,
-            log_prediction=self.wer.log_prediction,
-            dist_sync_on_step=True,
-        )
+            self.wer = RNNTBPEWER(
+                decoding=self.decoding,
+                batch_dim_index=self.wer.batch_dim_index,
+                use_cer=self.wer.use_cer,
+                log_prediction=self.wer.log_prediction,
+                dist_sync_on_step=True,
+            )
 
-        # Setup fused Joint step
-        if self.joint.fuse_loss_wer or (
-            self.decoding.joint_fused_batch_size is not None and self.decoding.joint_fused_batch_size > 0
-        ):
-            self.joint.set_loss(self.loss)
-            self.joint.set_wer(self.wer)
+            # Setup fused Joint step
+            if self.joint.fuse_loss_wer or (
+                self.decoding.joint_fused_batch_size is not None and self.decoding.joint_fused_batch_size > 0
+            ):
+                self.joint.set_loss(self.loss)
+                self.joint.set_wer(self.wer)
 
-        # Update config
-        with open_dict(self.cfg.decoding):
-            self.cfg.decoding = decoding_cfg
+            # Update config
+            with open_dict(self.cfg.decoding):
+                self.cfg.decoding = decoding_cfg
 
-        logging.info(f"Changed decoding strategy to \n{OmegaConf.to_yaml(self.cfg.decoding)}")
+            self.use_rnnt_decoder = True
+            logging.info(f"Changed decoding strategy to \n{OmegaConf.to_yaml(self.cfg.decoding)}")
+        else:
+            assert decoder_type == 'ctc' and hasattr(self, 'ctc_decoder')
+            if decoding_cfg is None:
+                # Assume same decoding config as before
+                logging.info("No `decoding_cfg` passed when changing decoding strategy, using internal config")
+                decoding_cfg = self.cfg.ctc.decoding
+
+            # Assert the decoding config with all hyper parameters
+            decoding_cls = OmegaConf.structured(CTCBPEDecodingConfig)
+            decoding_cls = OmegaConf.create(OmegaConf.to_container(decoding_cls))
+            decoding_cfg = OmegaConf.merge(decoding_cls, decoding_cfg)
+
+            self.ctc_decoding = CTCBPEDecoding(decoding_cfg=decoding_cfg, tokenizer=self.tokenizer)
+
+            self.ctc_wer = WERBPE(
+                decoding=self.ctc_decoding,
+                use_cer=self.ctc_wer.use_cer,
+                log_prediction=self.ctc_wer.log_prediction,
+                dist_sync_on_step=True,
+            )
+
+            # Update config
+            with open_dict(self.cfg.ctc):
+                self.cfg.ctc.decoding = decoding_cfg
+
+            self.use_rnnt_decoder = False
+            logging.info(f"Changed decoding strategy to \n{OmegaConf.to_yaml(self.cfg.decoding)}")
 
     def _setup_dataloader_from_config(self, config: Optional[Dict]):
         if 'augmentor' in config:
