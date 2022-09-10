@@ -1235,15 +1235,23 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
     @typecheck()
     def forward(
         self,
-        encoder_outputs: torch.Tensor,
+        encoder_outputs: Union[torch.Tensor, Tuple[torch.Tensor]],
         decoder_outputs: Optional[torch.Tensor],
         encoder_lengths: Optional[torch.Tensor] = None,
         transcripts: Optional[torch.Tensor] = None,
         transcript_lengths: Optional[torch.Tensor] = None,
         compute_wer: bool = False,
+        compute_dual_mode_kd_loss: bool = False
     ) -> Union[torch.Tensor, List[Optional[torch.Tensor]]]:
         # encoder = (B, D, T)
         # decoder = (B, D, U) if passed, else None
+        if compute_dual_mode_kd_loss:
+            # TODO set up vars for rnnt_kd_loss
+            # may be assert here over input type?
+            teacher_outputs = encoder_outputs[0].transpose(1, 2)
+            encoder_outputs = encoder_outputs[1]
+            teacher_losses, rnnt_kd_losses = [], []
+
         encoder_outputs = encoder_outputs.transpose(1, 2)  # (B, T, D)
 
         if decoder_outputs is not None:
@@ -1296,6 +1304,9 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
                 max_sub_enc_length = sub_enc_lens.max()
                 max_sub_transcript_length = sub_transcript_lens.max()
 
+                if compute_dual_mode_kd_loss:
+                    sub_teacher_enc = teacher_outputs.narrow(dim=0, start=begin, length=end - begin)
+
                 if decoder_outputs is not None:
                     # Reduce encoder length to preserve computation
                     # Encoder: [sub-batch, T, D] -> [sub-batch, T', D]; T' < T
@@ -1312,6 +1323,9 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
 
                     # Perform joint => [sub-batch, T', U', V + 1]
                     sub_joint = self.joint(sub_enc, sub_dec)
+
+                    if compute_dual_mode_kd_loss:
+                        sub_teacher_joint = self.joint(sub_teacher_enc, sub_dec)
 
                     del sub_dec
 
@@ -1339,6 +1353,31 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
                     # reset loss reduction type
                     self.loss.reduction = loss_reduction
 
+                    if compute_dual_mode_kd_loss:
+                        loss_reduction = self.loss.reduction
+                        self.loss.reduction = None
+
+                        teacher_loss_batch = self.loss(
+                            log_probs=sub_teacher_joint,
+                            targets=sub_transcripts,
+                            input_lengths=sub_enc_lens,
+                            target_lengths=sub_transcript_lens,
+                        )
+
+                        teacher_losses.append(teacher_loss_batch)
+                        self.loss.reduction = loss_reduction
+
+                        loss_reduction = self._rnnt_kd_loss.reduction
+                        self._rnnt_kd_loss.reduction = None
+                        kd_loss_batch = self._rnnt_kd_loss(
+                            teacher_log_probs=sub_teacher_joint,
+                            student_log_probs=sub_joint,
+                            targets=sub_transcripts,
+                            input_lengths=sub_enc_lens,
+                            target_lengths=sub_transcript_lens,
+                        )
+                        self._rnnt_kd_loss.reduction = loss_reduction
+                        rnnt_kd_losses.append(kd_loss_batch)
                 else:
                     losses = None
 
@@ -1351,7 +1390,16 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
                     # Update WER on each process without syncing
                     self.wer.update(sub_enc, sub_enc_lens, sub_transcripts, sub_transcript_lens)
 
+                    if compute_dual_mode_kd_loss:
+                        sub_teacher_enc = sub_teacher_enc.transpose(1, 2)
+                        sub_teacher_enc = sub_teacher_enc.detach()
+                        self.teacher_wer.update(sub_teacher_enc, sub_enc_lens, sub_transcripts, sub_transcript_lens)
+
+
                 del sub_enc, sub_transcripts, sub_enc_lens, sub_transcript_lens
+                if compute_dual_mode_kd_loss:
+                    del sub_teacher_enc
+
 
             # Collect sub batch loss results
             if losses is not None:
@@ -1369,6 +1417,22 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
                 wer = None
                 wer_num = None
                 wer_denom = None
+            
+            if compute_dual_mode_kd_loss:
+                if teacher_losses and losses:
+                    teacher_losses = torch.cat(teacher_losses, 0)
+                    teacher_losses = teacher_losses.mean()
+
+                    rnnt_kd_losses = torch.cat(rnnt_kd_losses, 0)
+                    rnnt_kd_losses = rnnt_kd_losses.mean()
+                    losses = (teacher_losses, losses, rnnt_kd_losses)
+
+                if compute_wer:
+                    teacher_wer, teacher_wer_num, teacher_wer_denom = self.teacher_wer.compute()
+                    self.teacher_wer.reset()
+                    wer = (teacher_wer, wer)
+                    wer_num = (teacher_wer_num, wer_num)
+                    wer_denom = (teacher_wer_denom, wer_denom)
 
             return losses, wer, wer_num, wer_denom
 
@@ -1495,6 +1559,13 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         self._loss = loss
 
     @property
+    def rnnt_kd_loss(self):
+        return self._rnnt_kd_loss
+
+    def set_rnnt_kd_loss(self, loss):
+        self._rnnt_kd_loss = loss
+
+    @property
     def wer(self):
         return self._wer
 
@@ -1503,6 +1574,13 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
             raise ValueError("Attempting to set WER module even though `fuse_loss_wer` is not set!")
 
         self._wer = wer
+
+    @property
+    def teacher_wer(self):
+        return self._teacher_wer
+
+    def set_teacher_wer(self, wer):
+        self._teacher_wer = wer
 
     @property
     def fuse_loss_wer(self):

@@ -94,6 +94,23 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, Exportable):
             dist_sync_on_step=True,
         )
 
+        self.compute_dual_mode_kd_loss = self.cfg.encoder.get('fullcontext_streaming_kd', False)
+        if self.compute_dual_mode_kd_loss:
+            self.rnnt_kd_loss = RNNTKDLoss(
+                num_classes=self.joint.num_classes_with_blank - 1,
+                drop_last_joint_output=self.cfg.get('drop_last_joint_output', False)
+            )
+            self.teacher_wer = RNNTWER(
+                decoding=self.decoding,
+                batch_dim_index=0,
+                use_cer=self._cfg.get('use_cer', False),
+                log_prediction=self._cfg.get('log_prediction', True),
+                dist_sync_on_step=True,
+            )
+        else:
+            self.rnnt_kd_loss = None
+            self.teacher_wer = None
+
         # Whether to compute loss during evaluation
         if 'compute_eval_loss' in self.cfg:
             self.compute_eval_loss = self.cfg.compute_eval_loss
@@ -106,6 +123,10 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, Exportable):
         ):
             self.joint.set_loss(self.loss)
             self.joint.set_wer(self.wer)
+            self.joint.set_rnnt_kd_loss(self.rnnt_kd_loss)
+            self.joint.set_teacher_wer(self.teacher_wer)
+        else:
+            self.joint.set_rnnt_kd_loss(None)
 
         # Setup optimization normalization (if provided in config)
         self.setup_optim_normalization()
@@ -691,6 +712,13 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, Exportable):
         # If experimental fused Joint-Loss-WER is not used
         if not self.joint.fuse_loss_wer:
             # Compute full joint and loss
+            if self.compute_dual_mode_kd_loss:
+                fullcontext_joint = self.joint(encoder_outputs=encoded[0], decoder_outputs=decoder)
+                fullcontext_loss_value = self.loss(
+                    log_probs=fullcontext_joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
+                )
+                encoded = encoded[1]
+
             joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
             loss_value = self.loss(
                 log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
@@ -714,6 +742,16 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, Exportable):
                 _, scores, words = self.wer.compute()
                 self.wer.reset()
                 tensorboard_logs.update({'training_batch_wer': scores.float() / words})
+
+            if self.compute_dual_mode_kd_loss:
+                kd_loss_value = self.rnnt_kd_loss(
+                    teacher_log_probs=fullcontext_joint, student_log_probs=joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
+                )
+                tensorboard_logs['train_loss_fullcontext'] = fullcontext_loss_value
+                tensorboard_logs['train_loss_streaming'] = loss_value
+                tensorboard_logs['train_loss_kd'] = kd_loss_value
+                loss_value = self.cfg.rnnt_loss_weight * 0.5 * (loss_value + fullcontext_loss_value) + self.cfg.dual_mode_kd_loss_weight * kd_loss_value
+                tensorboard_logs['train_loss'] = loss_value
 
         else:
             # If experimental fused Joint-Loss-WER is used
@@ -744,6 +782,20 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, Exportable):
                 'learning_rate': self._optimizer.param_groups[0]['lr'],
                 'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
             }
+            if self.compute_dual_mode_kd_loss:
+                tensorboard_logs['train_loss_fullcontext'] = loss_value[0]
+                tensorboard_logs['train_loss_streaming'] = loss_value[1]
+                tensorboard_logs['train_loss_kd'] = loss_value[2]
+                # loss_value = loss_value[0] + loss_value[1] + loss_value[2]
+                kd_loss_value = loss_value[2]
+                loss_value = self.cfg.rnnt_loss_weight * 0.5 * (loss_value[0] + loss_value[1]) # + self.cfg.dual_mode_kd_loss_weight * loss_value[2]
+                if self.trainer.current_epoch >= self.cfg.dual_mode_kd_loss_start_epoch:
+                    loss_value += self.cfg.dual_mode_kd_loss_weight * kd_loss_value
+                tensorboard_logs['train_loss'] = loss_value 
+
+                if compute_wer:
+                    tensorboard_logs['training_batch_wer_fullcontext'] = wer[0]
+                    wer = wer[1]
 
             if compute_wer:
                 tensorboard_logs.update({'training_batch_wer': wer})
@@ -789,6 +841,21 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, Exportable):
         # If experimental fused Joint-Loss-WER is not used
         if not self.joint.fuse_loss_wer:
             if self.compute_eval_loss:
+                if compute_dual_mode_kd_loss:
+                    fullcontext_joint = self.joint(encoder_outputs=encoded[0], decoder_outputs=decoder)
+                    fullcontext_loss_value = self.loss(
+                        log_probs=fullcontext_joint, targets=transcript, input_lengths=encoded_len, target_lengths=target_length
+                    )
+                    self.wer.update(encoder[1], encoded_len, transcript, transcript_len)
+                    wer, wer_num, wer_denom = self.wer.compute()
+                    self.wer.reset()
+
+                    tensorboard_logs['val_wer_num_fullcontext'] = wer_num
+                    tensorboard_logs['val_wer_denom_fullcontext'] = wer_denom
+                    tensorboard_logs['val_wer_fullcontext'] = wer
+
+                    encoded = encoded[1]
+
                 decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
                 joint = self.joint(encoder_outputs=encoded, decoder_outputs=decoder)
 
@@ -797,6 +864,16 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, Exportable):
                 )
 
                 tensorboard_logs['val_loss'] = loss_value
+
+                if compute_dual_mode_kd_loss:
+                    kd_loss_value = self.rnnt_kd_loss(
+                        teacher_log_probs=fullcontext_joint, student_log_probs=joint, target=transcript, input_lengths=encoded_len, target_lengths=target_length
+                    )
+                    tensorboard_logs['val_loss_fullcontext'] = fullcontext_loss_value
+                    tensorboard_logs['val_loss_streaming'] = loss_value
+                    tensorboard_logs['val_loss_kd'] = kd_loss_value
+                    loss_value = self.cfg.rnnt_loss_weight * 0.5 * (loss_value + fullcontext_loss_value) + self.cfg.dual_mode_kd_loss_weight * kd_loss_value
+                    tensorboard_logs['val_loss'] = loss_value
 
             self.wer.update(encoded, encoded_len, transcript, transcript_len)
             wer, wer_num, wer_denom = self.wer.compute()
@@ -824,10 +901,26 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, Exportable):
                 transcripts=transcript,
                 transcript_lengths=target_len,
                 compute_wer=compute_wer,
+                compute_dual_mode_kd_loss=False
             )
 
             if loss_value is not None:
                 tensorboard_logs['val_loss'] = loss_value
+                if compute_dual_mode_kd_loss:
+                    tensorboard_logs['val_loss_fullcontext'] = loss_value[0]
+                    tensorboard_logs['val_loss_streaming'] = loss_value[1]
+                    tensorboard_logs['val_loss_kd'] = loss_value[2]
+                    # loss_value = loss_value[0] + loss_value[1] + loss_value[2]
+                    loss_value = self.cfg.rnnt_loss_weight * 0.5 * (loss_value[0] + loss_value[1]) + self.cfg.dual_mode_kd_loss_weight * loss_value[2]
+                    tensorboard_logs['val_loss'] = loss_value 
+
+                    tensorboard_logs['val_wer_num_fullcontext'] = wer_num[0]
+                    tensorboard_logs['val_wer_denom_fullcontext'] = wer_denom[0]
+                    tensorboard_logs['val_wer_fullcontext'] = wer[0]
+
+                    wer_num = wer_num[1]
+                    wer_denom = wer_denom[1]
+                    wer = wer[1]
 
             tensorboard_logs['val_wer_num'] = wer_num
             tensorboard_logs['val_wer_denom'] = wer_denom
@@ -844,30 +937,51 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, Exportable):
             'test_wer_denom': logs['val_wer_denom'],
             # 'test_wer': logs['val_wer'],
         }
+
+        for k,v in logs.items():
+            if k.startswith('val_'):
+                test_logs['test'+k[3:]] = v
+
         if 'val_loss' in logs:
             test_logs['test_loss'] = logs['val_loss']
         return test_logs
 
     def multi_validation_epoch_end(self, outputs, dataloader_idx: int = 0):
-        if self.compute_eval_loss:
-            val_loss_mean = torch.stack([x['val_loss'] for x in outputs]).mean()
-            val_loss_log = {'val_loss': val_loss_mean}
-        else:
-            val_loss_log = {}
-        wer_num = torch.stack([x['val_wer_num'] for x in outputs]).sum()
-        wer_denom = torch.stack([x['val_wer_denom'] for x in outputs]).sum()
-        tensorboard_logs = {**val_loss_log, 'val_wer': wer_num.float() / wer_denom}
+        val_loss_log = {}
+        val_loss_keys = [k for k in outputs[0].keys() if k.startswith('val_loss_')]
+        for k in val_loss_keys:
+            val_loss_mean = torch.stack([x[k] for x in outputs]).mean()
+            val_loss_log[k] = val_loss_mean
+
+        tensorboard_logs = {**val_loss_log}
+        val_wer_num_keys = [k for k in outputs[0].keys() if k.startswith('val_wer_num')]
+        for k in val_wer_num_keys:
+            k_num = k
+            k_denom = k[:7] + '_denom' + k[11:]
+            k = k[:7] + k[11:]
+            wer_num = torch.stack([x[k_num] for x in outputs]).sum()
+            wer_denom = torch.stack([x[k_denom] for x in outputs]).sum()
+            tensorboard_logs[k] =  wer_num.float() / wer_denom
+
         return {**val_loss_log, 'log': tensorboard_logs}
 
     def multi_test_epoch_end(self, outputs, dataloader_idx: int = 0):
-        if self.compute_eval_loss:
-            test_loss_mean = torch.stack([x['test_loss'] for x in outputs]).mean()
-            test_loss_log = {'test_loss': test_loss_mean}
-        else:
-            test_loss_log = {}
-        wer_num = torch.stack([x['test_wer_num'] for x in outputs]).sum()
-        wer_denom = torch.stack([x['test_wer_denom'] for x in outputs]).sum()
-        tensorboard_logs = {**test_loss_log, 'test_wer': wer_num.float() / wer_denom}
+        test_loss_log = {}
+        test_loss_keys = [k for k in outputs[0].keys() if k.startswith('test_loss_')]
+        for k in test_loss_keys:
+            test_loss_mean = torch.stack([x[k] for x in outputs]).mean()
+            test_loss_log[k] = test_loss_mean
+
+        tensorboard_logs = {**test_loss_log}
+        test_wer_num_keys = [k for k in outputs[0].keys() if k.startswith('test_wer_num')]
+        for k in test_wer_num_keys:
+            k_num = k
+            k_denom = k[:8] + '_denom' + k[12:]
+            k = k[:8] + k[12:]
+            wer_num = torch.stack([x[k_num] for x in outputs]).sum()
+            wer_denom = torch.stack([x[k_denom] for x in outputs]).sum()
+            tensorboard_logs[k] =  wer_num.float() / wer_denom
+
         return {**test_loss_log, 'log': tensorboard_logs}
 
     def _setup_transcribe_dataloader(self, config: Dict) -> 'torch.utils.data.DataLoader':

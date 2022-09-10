@@ -304,3 +304,161 @@ class RNNTLoss(Loss):
         )
 
         return loss
+
+
+class RNNTKDLoss(Loss):
+    @property
+    def input_types(self):
+        """Input types definitions for CTCLoss.
+        """
+        return {
+            "teacher_log_probs": NeuralType(('B', 'T', 'T', 'D'), LogprobsType()),
+            "student_log_probs": NeuralType(('B', 'T', 'T', 'D'), LogprobsType()),
+            "targets": NeuralType(('B', 'T'), LabelsType()),
+            "input_lengths": NeuralType(tuple('B'), LengthsType()),
+            "target_lengths": NeuralType(tuple('B'), LengthsType()),
+        }
+
+    @property
+    def output_types(self):
+        """Output types definitions for CTCLoss.
+        loss:
+            NeuralType(None)
+        """
+        return {"loss": NeuralType(elements_type=LossType())}
+
+    def __init__(self, num_classes, reduction: str = 'mean_batch', drop_last_joint_output=False):
+        """
+        RNN-T Loss function based on https://github.com/HawkAaron/warp-transducer.
+        """
+        super(RNNTKDLoss, self).__init__()
+
+        if reduction not in [None, 'mean', 'sum', 'mean_batch']:
+            raise ValueError('`reduction` must be one of [mean, sum, mean_batch]')
+
+        self._blank = num_classes
+        self.reduction = reduction
+        self.drop_last_joint_output = drop_last_joint_output
+
+    @typecheck()
+    def forward(self, teacher_log_probs, student_log_probs, targets, input_lengths, target_lengths):
+        teacher_log_probs = teacher_log_probs.detach()
+
+        # Cast to int 32
+        targets = targets.int()
+        input_lengths = input_lengths.int()
+        target_lengths = target_lengths.int()
+
+        max_logit_len = input_lengths.max()
+        max_targets_len = target_lengths.max()
+
+        # Force cast joint to float32
+        # TODO: Remove once Numba supports FP16
+        if teacher_log_probs.dtype != torch.float32:
+            logits_orig = teacher_log_probs
+            teacher_log_probs = teacher_log_probs.float()
+            del logits_orig  # save memory *before* computing the loss
+        if student_log_probs.dtype != torch.float32:
+            logits_orig = student_log_probs
+            student_log_probs = student_log_probs.float()
+            del logits_orig  # save memory *before* computing the loss
+
+        # Ensure that shape mismatch does not occur due to padding
+        # Due to padding and subsequent downsampling, it may be possible that
+        # max sequence length computed does not match the actual max sequence length
+        # of the log_probs tensor, therefore we increment the input_lengths by the difference.
+        # This difference is generally small.
+        if teacher_log_probs.shape[1] != max_logit_len:
+            teacher_log_probs = teacher_log_probs.narrow(dim=1, start=0, length=max_logit_len).contiguous()
+        if student_log_probs.shape[1] != max_logit_len:
+            student_log_probs = student_log_probs.narrow(dim=1, start=0, length=max_logit_len).contiguous()
+
+        # Reduce transcript length to correct alignment if additional padding was applied.
+        # Transcript: [B, L] -> [B, L']; If L' < L
+        if targets.shape[1] != max_targets_len:
+            targets = targets.narrow(dim=1, start=0, length=max_targets_len)
+
+        if not self.drop_last_joint_output:
+            B, T, U, V = teacher_log_probs.size()
+            # print(teacher_log_probs.size(), student_log_probs.size(), target_lengths)
+            # print(ids.device, student_log_probs.device, teacher_log_probs.device, target_lengths.device, input_lengths.device)
+            ids = torch.arange(B * T).to(target_lengths.device) * U + target_lengths.unsqueeze(-1).repeat(1, T).view(-1)
+            student_last_enc_log_probs = student_log_probs.view(-1, V)[ids].view(B, T, V)
+            teacher_last_enc_log_probs = teacher_log_probs.view(-1, V)[ids].view(B, T, V)
+
+            teacher_last_enc_blank_prob = torch.softmax(teacher_last_enc_log_probs, dim=-1)[:,:,self._blank]
+            student_last_enc_blank_prob = torch.softmax(student_last_enc_log_probs, dim=-1)[:,:,self._blank]
+
+            loss = - teacher_last_enc_blank_prob * torch.log(torch.clamp(student_last_enc_blank_prob, 1e-6, 1)) - \
+                  (1 - teacher_last_enc_blank_prob) * torch.log(torch.clamp(1 - student_last_enc_blank_prob, 1e-6, 1))
+
+            input_mask = torch.arange(T).to(input_lengths.device).unsqueeze(0).repeat(B, 1) < input_lengths.unsqueeze(-1)
+            kld = torch.sum(input_mask * loss, dim=1)
+        else:
+            kld = 0.
+
+        teacher_log_probs = teacher_log_probs[:,:,:-1]
+        student_log_probs = student_log_probs[:,:,:-1]
+
+        teacher_probs = torch.softmax(teacher_log_probs, dim=-1)
+        student_probs = torch.softmax(student_log_probs, dim=-1)
+        del teacher_log_probs, student_log_probs
+
+        teacher_probs_blank = teacher_probs[:,:,:,self._blank]
+        student_probs_blank = student_probs[:,:,:,self._blank]
+
+        B, T, U, V = teacher_probs.size()
+        ids = torch.arange(B * T * U).to(targets.device) * V + targets.unsqueeze(1).repeat(1, T, 1).view(-1)
+        teacher_probs_y = teacher_probs.view(-1)[ids].reshape(B, T, U)
+        student_probs_y = student_probs.view(-1)[ids].reshape(B, T, U)
+
+        teacher_probs_rest = 1. - teacher_probs_blank - teacher_probs_y
+        student_probs_rest = 1. - student_probs_blank - student_probs_y
+
+        del teacher_probs, student_probs
+
+        teacher_probs = torch.cat([
+            teacher_probs_blank.unsqueeze(-1),
+            teacher_probs_y.unsqueeze(-1),
+            teacher_probs_rest.unsqueeze(-1)],
+            dim=-1
+        )
+
+        student_log_probs = torch.cat([
+            torch.log(torch.clamp(student_probs_blank.unsqueeze(-1), 1e-6, 1)),
+            torch.log(torch.clamp(student_probs_y.unsqueeze(-1), 1e-6, 1)),
+            torch.log(torch.clamp(student_probs_rest.unsqueeze(-1), 1e-6, 1))],
+            dim=-1
+        )
+
+        input_mask = torch.arange(T).to(input_lengths.device).unsqueeze(0).repeat(B, 1) < input_lengths.unsqueeze(-1)
+        target_mask = torch.arange(U).to(input_lengths.device).unsqueeze(0).repeat(B, 1) < target_lengths.unsqueeze(-1)
+        mask = input_mask.unsqueeze(-1) * target_mask.unsqueeze(1)
+        mask = mask.to(student_log_probs.device).type_as(student_log_probs)
+        loss = mask * torch.sum(-teacher_probs * student_log_probs, dim=-1)
+
+        loss = torch.sum(loss, dim=-1)
+        kld = kld + torch.sum(loss, dim=-1)
+
+        if self.reduction == 'sum':
+            kld = torch.sum(kld)
+
+        elif self.reduction == 'mean_batch':
+            kld = torch.mean(kld)
+
+        # del new variables that may have been created
+        del (
+            teacher_probs,
+            teacher_probs_blank,
+            teacher_probs_y,
+            teacher_probs_rest,
+            student_log_probs,
+            student_probs_blank,
+            student_probs_y,
+            student_probs_rest,
+            targets,
+            input_lengths,
+            target_lengths,
+        )
+
+        return kld

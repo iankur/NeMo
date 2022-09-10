@@ -56,6 +56,7 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
         pos_bias_u=None,
         pos_bias_v=None,
         att_context_size=[-1, -1],
+        conv_dual_mode=False,
     ):
         super(ConformerLayer, self).__init__()
 
@@ -65,19 +66,23 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
 
         # first feed forward module
         self.norm_feed_forward1 = LayerNorm(d_model)
+        self.streaming_norm_feed_forward1 = LayerNorm(d_model)
         self.feed_forward1 = ConformerFeedForward(d_model=d_model, d_ff=d_ff, dropout=dropout)
 
         # convolution module
         self.norm_conv = LayerNorm(d_model)
+        self.streaming_norm_conv = LayerNorm(d_model)
         self.conv = ConformerConvolution(
             d_model=d_model,
             kernel_size=conv_kernel_size,
             norm_type=conv_norm_type,
             conv_context_size=conv_context_size,
+            masked_depthwise_conv=conv_dual_mode,
         )
 
         # multi-headed self-attention module
         self.norm_self_att = LayerNorm(d_model)
+        self.streaming_norm_self_att = LayerNorm(d_model)
         MHA_max_cache_len = att_context_size[0]
 
         if self_attention_model == 'rel_pos':
@@ -101,10 +106,12 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
 
         # second feed forward module
         self.norm_feed_forward2 = LayerNorm(d_model)
+        self.streaming_norm_feed_forward2 = LayerNorm(d_model)
         self.feed_forward2 = ConformerFeedForward(d_model=d_model, d_ff=d_ff, dropout=dropout)
 
         self.dropout = nn.Dropout(dropout)
         self.norm_out = LayerNorm(d_model)
+        self.streaming_norm_out = LayerNorm(d_model)
 
     def forward(
         self,
@@ -116,6 +123,8 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
         cache_last_channel=None,
         cache_last_time_next=None,
         cache_last_channel_next=None,
+        conv_dual_mode=False,
+        streaming=False
     ):
         """
         Args:
@@ -131,11 +140,17 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
             x (torch.Tensor): (B, T, d_model)
         """
         residual = x
-        x = self.norm_feed_forward1(x)
+        if streaming:
+            x = self.streaming_norm_feed_forward1(x)
+        else:
+            x = self.norm_feed_forward1(x)
         x = self.feed_forward1(x)
         residual = residual + self.dropout(x) * self.fc_factor
 
-        x = self.norm_self_att(residual)
+        if streaming:
+            x = self.streaming_norm_self_att(residual)
+        else:
+            x = self.norm_self_att(residual)
         if self.self_attention_model == 'rel_pos':
             x = self.self_attn(
                 query=x,
@@ -154,15 +169,26 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
             x = None
         residual = residual + self.dropout(x)
 
-        x = self.norm_conv(residual)
-        x = self.conv(x, pad_mask=pad_mask, cache=cache_last_time, cache_next=cache_last_time_next)
+        if streaming:
+            x = self.streaming_norm_conv(residual)
+        else:
+            x = self.norm_conv(residual)
+        x = self.conv(
+            x, pad_mask=pad_mask, cache=cache_last_time, cache_next=cache_last_time_next, masked_depthwise_conv=conv_dual_mode, streaming=streaming
+        )
         residual = residual + self.dropout(x)
 
-        x = self.norm_feed_forward2(residual)
+        if streaming:
+            x = self.streaming_norm_feed_forward2(residual)
+        else:
+            x = self.norm_feed_forward2(residual)
         x = self.feed_forward2(x)
         residual = residual + self.dropout(x) * self.fc_factor
 
-        x = self.norm_out(residual)
+        if streaming:
+            x = self.streaming_norm_out(residual)
+        else:
+            x = self.norm_out(residual)
 
         if self.is_adapter_available():
             # Call the adapters
@@ -185,7 +211,7 @@ class ConformerConvolution(nn.Module):
     """
 
     def __init__(
-        self, d_model, kernel_size, norm_type='batch_norm', conv_context_size=None, pointwise_activation='glu_'
+        self, d_model, kernel_size, norm_type='batch_norm', conv_context_size=None, pointwise_activation='glu_', masked_depthwise_conv=False
     ):
         super(ConformerConvolution, self).__init__()
         assert (kernel_size - 1) % 2 == 0
@@ -219,6 +245,15 @@ class ConformerConvolution(nn.Module):
                 groups=d_model,
                 bias=True,
             )
+            
+            if masked_depthwise_conv:
+                # 0 will mask the kernel values
+                depthwise_conv_kernel_mask = torch.cat([
+                    torch.ones(dw_conv_input_dim, dw_conv_input_dim // dw_conv_input_dim, (kernel_size + 1) // 2),
+                    torch.zeros(dw_conv_input_dim, dw_conv_input_dim // dw_conv_input_dim, kernel_size // 2)],
+                    dim=-1
+                )
+                self.register_buffer('depthwise_conv_kernel_mask', depthwise_conv_kernel_mask, persistent=False)
         else:
             self.depthwise_conv = CausalConv1D(
                 in_channels=dw_conv_input_dim,
@@ -236,6 +271,7 @@ class ConformerConvolution(nn.Module):
             self.batch_norm = nn.InstanceNorm1d(dw_conv_input_dim)
         elif norm_type == 'layer_norm':
             self.batch_norm = nn.LayerNorm(dw_conv_input_dim)
+            self.streaming_batch_norm = nn.LayerNorm(dw_conv_input_dim)
         elif norm_type.startswith('group_norm'):
             num_groups = int(norm_type.replace("group_norm", ""))
             self.batch_norm = nn.GroupNorm(num_groups=num_groups, num_channels=d_model)
@@ -247,7 +283,20 @@ class ConformerConvolution(nn.Module):
             in_channels=dw_conv_input_dim, out_channels=d_model, kernel_size=1, stride=1, padding=0, bias=True
         )
 
-    def forward(self, x, pad_mask=None, cache=None, cache_next=None):
+    def _depthwise_conv(self, x, cache=None, cache_next=None, masked_conv=False):
+        if masked_conv and cache:
+            raise NotImplementedError
+        if cache is not None:
+            return self.depthwise_conv(x, cache=cache, cache_next=cache_next)
+        elif not masked_conv:
+            return self.depthwise_conv(x)
+        else:
+            assert masked_conv is True
+            kernel = self.depthwise_conv.weight * self.depthwise_conv_kernel_mask
+            return F.conv1d(x, kernel, self.depthwise_conv.bias,
+                    stride=1, padding=(self.kernel_size - 1) // 2, groups=self.d_model)
+
+    def forward(self, x, pad_mask=None, cache=None, cache_next=None, masked_depthwise_conv=False, streaming=False):
         x = x.transpose(1, 2)
         x = self.pointwise_conv1(x)
 
@@ -260,14 +309,18 @@ class ConformerConvolution(nn.Module):
         if pad_mask is not None:
             x = x.float().masked_fill(pad_mask.unsqueeze(1), 0.0)
 
-        if cache is not None:
-            x = self.depthwise_conv(x, cache=cache, cache_next=cache_next)
-        else:
-            x = self.depthwise_conv(x)
+        # if cache is not None:
+        #     x = self.depthwise_conv(x, cache=cache, cache_next=cache_next)
+        # else:
+        #     x = self.depthwise_conv(x)
+        x = self._depthwise_conv(x, cache=cache, cache_next=cache_next, masked_conv=masked_depthwise_conv)
 
         if self.norm_type == "layer_norm":
             x = x.transpose(1, 2)
-            x = self.batch_norm(x)
+            if streaming:
+                x = self.streaming_batch_norm(x)
+            else:
+                x = self.batch_norm(x)
             x = x.transpose(1, 2)
         else:
             x = self.batch_norm(x)
