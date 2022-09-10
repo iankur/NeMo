@@ -254,7 +254,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable):
 
         self._feat_out = d_model
 
-        if not untie_biases and self_attention_model == "rel_pos":
+        if not untie_biases and "rel_pos" in self_attention_model:
             d_head = d_model // n_heads
             pos_bias_u = nn.Parameter(torch.Tensor(n_heads, d_head))
             pos_bias_v = nn.Parameter(torch.Tensor(n_heads, d_head))
@@ -264,9 +264,49 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable):
             pos_bias_u = None
             pos_bias_v = None
 
+        self.left_context = None
+        self.cur_context = None
+        self.right_context = None
+
         self.pos_emb_max_len = pos_emb_max_len
         if self_attention_model == "rel_pos":
             self.pos_enc = RelPositionalEncoding(
+                d_model=d_model,
+                dropout_rate=dropout,
+                max_len=pos_emb_max_len,
+                xscale=self.xscale,
+                dropout_rate_emb=dropout_emb,
+            )
+        elif self_attention_model in ["longformer_chunked_rel_pos", "longformer_overlap_rel_pos"]:
+            #TODO better handling of att context params
+            max_left_context_size = att_context_size[0]
+            if self_attention_model == 'longformer_overlap_rel_pos':
+                max_right_context_size = att_context_size[1]
+                max_chunk_size = 1
+            else:
+                max_chunk_size = att_context_size[1]
+                # TODO we add 'full' if nonstreaming case, need to change for that
+                max_right_context_size = att_context_size[2] if len(att_context_size) > 2 else 0
+                if max_right_context_size == 'full':
+                    max_right_context_size = 0
+
+            if isinstance(max_left_context_size, list):
+                max_left_context_size = max(max_left_context_size)
+
+            if isinstance(max_chunk_size, list):
+                max_chunk_size = max(max_chunk_size)
+
+            if isinstance(max_right_context_size, list):
+                max_right_context_size = max(max_right_context_size)
+
+            self.left_context = max_left_context_size
+            self.cur_context = max_chunk_size
+            self.right_context = max_right_context_size
+
+            self.pos_enc = ChunkedRelPositionalEncoding(
+                left_chunk_size=max_left_context_size,
+                chunk_size=max_chunk_size,
+                right_chunk_size=max_right_context_size,
                 d_model=d_model,
                 dropout_rate=dropout,
                 max_len=pos_emb_max_len,
@@ -420,6 +460,9 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable):
                 cache_last_channel=cache_last_channel,
                 cache_last_time_next=cache_last_time_next,
                 cache_last_channel_next=cache_last_channel_next,
+                left_chunk_size=self.left_context,
+                chunk_size=self.cur_context,
+                right_chunk_size=self.right_context,
             )
 
         if self.out_proj is not None:

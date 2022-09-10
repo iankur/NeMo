@@ -80,7 +80,7 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
         self.norm_self_att = LayerNorm(d_model)
         MHA_max_cache_len = att_context_size[0]
 
-        if self_attention_model == 'rel_pos':
+        if self_attention_model in ['rel_pos', 'longformer_chunked_rel_pos', 'longformer_overlap_rel_pos']:
             self.self_attn = RelPositionMultiHeadAttention(
                 n_head=n_heads,
                 n_feat=d_model,
@@ -88,6 +88,7 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
                 pos_bias_u=pos_bias_u,
                 pos_bias_v=pos_bias_v,
                 max_cache_len=MHA_max_cache_len,
+                att_type=self_attention_model,
             )
         elif self_attention_model == 'abs_pos':
             self.self_attn = MultiHeadAttention(
@@ -116,6 +117,9 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
         cache_last_channel=None,
         cache_last_time_next=None,
         cache_last_channel_next=None,
+        left_chunk_size=None,
+        chunk_size=None,
+        right_chunk_size=None,
     ):
         """
         Args:
@@ -146,6 +150,9 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
                 cache=cache_last_channel,
                 cache_next=cache_last_channel_next,
             )
+        elif self.self_attention_model in ['longformer_overlap_rel_pos', 'longformer_chunked_rel_pos']:
+            x = self.self_attn(query=x, key=x, value=x, mask=pad_mask, pos_emb=pos_emb,
+                    left_chunk_size=left_chunk_size, chunk_size=chunk_size, right_chunk_size=right_chunk_size)
         elif self.self_attention_model == 'abs_pos':
             x = self.self_attn(
                 query=x, key=x, value=x, mask=att_mask, cache=cache_last_channel, cache_next=cache_last_channel_next
