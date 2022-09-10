@@ -167,6 +167,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable):
         dropout=0.1,
         dropout_emb=0.1,
         dropout_att=0.0,
+        group_size=1,
     ):
         super().__init__()
         d_ff = d_model * ff_expansion_factor
@@ -272,6 +273,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable):
                 max_len=pos_emb_max_len,
                 xscale=self.xscale,
                 dropout_rate_emb=dropout_emb,
+                group_size=group_size,
             )
         elif self_attention_model == "abs_pos":
             pos_bias_u = None
@@ -297,6 +299,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable):
                 pos_bias_u=pos_bias_u,
                 pos_bias_v=pos_bias_v,
                 att_context_size=self.att_context_size,
+                group_size=group_size,
             )
             self.layers.append(layer)
 
@@ -308,6 +311,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable):
             self._feat_out = d_model
         self.set_max_audio_length(self.pos_emb_max_len)
         self.use_pad_mask = True
+        self.group_size = group_size
 
         self.setup_streaming_params()
         self.export_cache_support = False
@@ -350,6 +354,9 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable):
     def forward(self, audio_signal, length, cache_last_channel=None, cache_last_time=None):
         self.update_max_seq_length(seq_length=audio_signal.size(2), device=audio_signal.device)
         max_audio_length: int = audio_signal.size(-1)
+
+        if max_audio_length + self.group_size - 1 > self.max_audio_length:
+            self.set_max_audio_length(max_audio_length)
 
         if length is None:
             length = audio_signal.new_full(

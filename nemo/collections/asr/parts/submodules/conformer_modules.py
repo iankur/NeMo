@@ -21,6 +21,7 @@ from nemo.collections.asr.parts.submodules.causal_convs import CausalConv1D
 from nemo.collections.asr.parts.submodules.multi_head_attention import (
     MultiHeadAttention,
     RelPositionMultiHeadAttention,
+    GroupedRelPositionMultiHeadAttention,
 )
 from nemo.collections.asr.parts.utils.activations import Swish
 from nemo.collections.common.parts.utils import activation_registry
@@ -56,6 +57,7 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
         pos_bias_u=None,
         pos_bias_v=None,
         att_context_size=[-1, -1],
+        group_size=1,
     ):
         super(ConformerLayer, self).__init__()
 
@@ -81,14 +83,19 @@ class ConformerLayer(torch.nn.Module, AdapterModuleMixin, AccessMixin):
         MHA_max_cache_len = att_context_size[0]
 
         if self_attention_model == 'rel_pos':
-            self.self_attn = RelPositionMultiHeadAttention(
-                n_head=n_heads,
-                n_feat=d_model,
-                dropout_rate=dropout_att,
-                pos_bias_u=pos_bias_u,
-                pos_bias_v=pos_bias_v,
-                max_cache_len=MHA_max_cache_len,
-            )
+            if group_size == 1:
+                self.self_attn = RelPositionMultiHeadAttention(
+                    n_head=n_heads,
+                    n_feat=d_model,
+                    dropout_rate=dropout_att,
+                    pos_bias_u=pos_bias_u,
+                    pos_bias_v=pos_bias_v,
+                    max_cache_len=MHA_max_cache_len,
+                )
+            else:
+                self.self_attn = GroupedRelPositionMultiHeadAttention(
+                    n_head=n_heads, n_feat=d_model, dropout_rate=dropout_att, pos_bias_u=pos_bias_u, pos_bias_v=pos_bias_v, group_size=group_size
+                )
         elif self_attention_model == 'abs_pos':
             self.self_attn = MultiHeadAttention(
                 n_head=n_heads, n_feat=d_model, dropout_rate=dropout_att, max_cache_len=MHA_max_cache_len
